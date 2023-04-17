@@ -1,0 +1,203 @@
+---
+title: "TCGA CopyKit Analysis `r params$patient_code`"
+author: "Anna K. Casasent, PhD"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    keep_md: true
+params:
+  data_path: "/TCGA"
+  disease_code: "LIHC"
+  bam_folder: "marked"
+  patient_code: "A3I0"
+  sample_info_file: "TCGA-FV-A3I0-01A-13D-A91S-52_sample_info.tsv"
+  cell_info_file: "TCGA-FV-A3I0-01A-13D-A91S-52_manifest.tsv"
+  file_sep: "/"
+  cor_res: 0.80
+  k_res: 5
+  output_folder: "00_Copykit_Basic_Analysis_Output"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = c("png", "pdf"), # which output figure type
+                      dpi = 300,  # figure dot per inch 
+                      echo = TRUE, # echos output of chunk in document
+                      cache = FALSE, 
+                      dep_auto = TRUE, # set it do try and figure out dependencies 
+                      cache.comments = FALSE, # allows you change comments
+                      tidy = TRUE, # Uses tidy to for a wrapper for code
+                      tidy.opts = list(width.cutoff=60), # character number 
+                      message = FALSE, # 
+                      error = TRUE,    # ignores ERRORS still produces a PDF <- dangerous
+                      include = TRUE,  # you can change this to be includes or excluded (to run or not to run)
+                      eval = TRUE,     # says to evaluate each code chunk 
+                      fig.height= 6,   # set standard figure height when included 
+                      fig.width = 8,   # set standard figure width when included
+                      fig.align = 'center' # centers the figure
+                      )
+```
+
+# Analysis 
+## Basic Processing 
+### Load the library 
+```{r library}
+library(copykit)
+library(params)
+library(readxl)
+library(tools)
+```
+
+### Analysis set up
+These are the items that were set up in the params feature that need to be changed when we change tumors. 
+```{r dir}
+params$data_path
+params$bam_folder
+params$patient_code
+params$sample_info_file
+params$cell_info_file
+params$file_sep
+params$cor_res
+params$k_res
+```
+
+### Read in files
+Here we read in the cell information, the sample information, and our bam files. 
+```{r files, message = FALSE}
+input_dir <- paste(params$data_path,params$disease_code, params$patient_code,sep= params$file_sep)
+output_dir <-  paste(params$data_path,params$disease_code, params$patient_code, params$output_folder, sep= params$file_sep)
+  if(!file.exists(output_dir))
+  { 
+    print("created output directory")
+    dir.create(output_dir)
+  }
+sample_info <- read.delim(paste(input_dir, params$sample_info_file, sep= params$file_sep))
+cell_info <- read.delim(paste(input_dir,  params$cell_info_file, sep= params$file_sep))
+
+# read in scDNA from 
+tumor <- runVarbin(paste(input_dir,params$bam_folder,sep=params$file_sep),
+                   remove_Y = TRUE, method="CBS", resolution="220kb")
+
+passing_bams <- ncol(tumor)
+```
+
+Add details about the different samples. 
+```{r add_TCGA_info}
+# add the information in the cell_info file to the cells 
+cell_info_order_sel <- cell_info[match(colnames(tumor), substring(cell_info$X.read1_filename, 0, (nchar(cell_info$X.read1_filename)-nchar(".fastq.gz")))),]
+cell_info_order_sel$cell_name <- substring(cell_info_order_sel$X.read1_filename, 0, nchar(cell_info_order_sel$X.read1_filename)-nchar(".fastq.gz"))
+
+#check that they match each other
+all(cell_info_order_sel$cell_name == tumor$sample)
+
+if(all(cell_info_order_sel$cell_name == tumor$sample))
+{
+  colData(tumor)$DNA.barcode <- cell_info_order_sel$DNA.barcode
+  colData(tumor)$cell_id <- cell_info_order_sel$cell_id
+  colData(tumor)$Sample <- cell_info_order_sel$Sample
+  colData(tumor)$Row <- cell_info_order_sel$Row
+  colData(tumor)$Col <- cell_info_order_sel$Col
+  colData(tumor)$ploidy <- cell_info_order_sel$ploidy
+  colData(tumor)$WELL <- cell_info_order_sel$WELL
+  colData(tumor)$Barcode <- cell_info_order_sel$Barcode
+  colData(tumor)$Cells1 <- cell_info_order_sel$Cells1
+  colData(tumor)$Signal1 <- cell_info_order_sel$Signal1
+  colData(tumor)$Confidence <- cell_info_order_sel$Confidence
+  # add the information from the sample_info files
+  colData(tumor)$sample_Short_ID <- sample_info$Short_ID
+  colData(tumor)$sample_Single_Core_ID <- sample_info$Single_Core_ID
+  colData(tumor)$sample_FAC_Tech <- sample_info$FAC_Tech
+  colData(tumor)$sample_FACs_Date <- sample_info$FACs_Date
+  colData(tumor)$sample_Dispense_Tech <- sample_info$Dispense_Tech
+  colData(tumor)$sample_Dispense_Date <- sample_info$Dispense_Date
+  colData(tumor)$sample_Library_Tech <- sample_info$Library_Tech
+  colData(tumor)$sample_Date_plate <- sample_info$Date_plate
+  colData(tumor)$sample_Chip.ID <- sample_info$Chip.ID
+  colData(tumor)$sample_Times <- sample_info$Times
+  colData(tumor)$sample_Tagmentation.time<- sample_info$Tagmentation.time
+  colData(tumor)$sample_Cycles<- sample_info$Cycles
+  colData(tumor)$sample_BP<- sample_info$BP
+  colData(tumor)$sample_Barcode_Plate <- sample_info$Barcode_Plate
+}
+
+```
+
+## QC Mertics
+```{r Metric}
+tumor <- runMetrics(tumor)
+colData(tumor)$mean_bin <- apply(bincounts(tumor), 2, mean)
+```
+
+```{r Preposses_QC_Metrics_plots}
+plotMetrics(tumor, metric = c("overdispersion", 
+                              "breakpoint_count",
+                              "reads_total",
+                              "reads_assigned_bins"),
+            label = "percentage_duplicates")
+```
+
+### Find Aneuploid
+```{r mark_aneuploid}
+# Mark aneuploid cells if they exist
+tumor <- findAneuploidCells(tumor)
+```
+
+### Filter Low Quality Cells
+The filtering for this samples used resolution `r params$cor_res` correlation with at least `r params$k_res`.
+```{r mark_low_quality}
+# Mark low-quality cells for filtering
+tumor <- findOutliers(tumor, resolution = params$cor_res, k=params$k_res)
+prefiltered_tumor <- tumor
+saveRDS(prefiltered_tumor, file=paste(output_dir, paste(sample_info$DNA.barcode,"prefiltered_tumor.rds", sep="_"), sep=params$file_sep))
+```
+
+## Per-filtered Heatmap 
+```{r Preposses_heatmap}
+# Visualize cells labeled by filter and aneuploid status
+plotHeatmap(tumor, label = c('outlier', 'is_aneuploid', 'ploidy', 'breakpoint_count', 'cell_corr_value','mean_bin'), row_split = 'outlier', n_threads=50)
+```
+
+# Filtering 
+
+## Filter Outlier & Ploidy
+Here we filter based on Computational outliers or if marked as diploid on a computational level. 
+
+```{r Preposses_filtering}
+# Remove cells marked as low-quality and/or aneuploid from the copykit object
+num_outliers <- sum(colData(tumor)$outlier == TRUE)
+tumor_rmoutliers <- tumor[,SummarizedExperiment::colData(tumor)$outlier == FALSE]
+#saveRDS(tumor_rmoutliers, file=paste0())
+saveRDS(tumor_rmoutliers, file=paste(output_dir, paste(sample_info$DNA.barcode,"tumor_rmoutliers_cor",params$cor_res,"k",params$k_res,".rds", sep="_"), sep=params$file_sep))
+
+num_normals <- sum(colData(tumor)$is_aneuploid == FALSE)
+tumor_rmnormals <- tumor[,SummarizedExperiment::colData(tumor)$is_aneuploid == TRUE]
+saveRDS(tumor_rmoutliers, file=paste(output_dir, paste(sample_info$DNA.barcode,"tumor_rmnormals.rds", sep="_"),sep=params$file_sep))
+
+tumor <- tumor[,SummarizedExperiment::colData(tumor)$outlier == FALSE]
+tumor <- tumor[,SummarizedExperiment::colData(tumor)$is_aneuploid == TRUE]
+
+saveRDS(tumor, file=paste(output_dir, paste(sample_info$DNA.barcode,"tumor_rmoutliers_cor",params$cor_res,"k",params$k_res,"rmnormals.rds", sep="_"), sep=params$file_sep))
+```
+
+# Summary 
+
+This sample started with `r nrow(cell_info)` fastq files.
+
+`r nrow(cell_info) - passing_bams` cells were dropped due to have too low coverage at the bam stage.
+
+`r num_normals ` cells were were consider normal. 
+
+`r num_outliers` cells were dropped due to having low correlation values with resolution `r params$cor_res` correlation with at least `r params$k_res`.
+
+These might not add up because samples because the normal cells are calculated with considering quality.  
+
+For this tumor we had `r ncol(tumor)` cell left after filtering both low quality and normal cells. 
+
+The information for this samples rds files were saves using: `r sample_info$DNA.barcode` at each step. 
+Please refer to this RMD/HTML report for questions. 
+
+# Session Info
+
+```{r sessioninfo}
+sessionInfo()
+```
